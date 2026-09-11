@@ -36,6 +36,10 @@ Day-to-day, top up with:
 python3 download.py --incremental
 ```
 
+The downloader exits **1** if any hour was lost to Dukascopy's intermittent
+503s after retries; run `python3 download.py --repair` to fill those hours. See
+[USAGE.md](USAGE.md#completeness-the-fetch-ledger-lost-hours-and-repair).
+
 See **[USAGE.md](USAGE.md)** for the full CLI, CSV schema, bi5 format, and
 monitoring details.
 
@@ -55,7 +59,9 @@ symbols + date range, start a detached download, and watch live progress
 (progress bar, ETA, ticks, retries) plus a tailing log — all read from the same
 `.download_status.json` the CLI writes. It refuses to start a second concurrent
 download and **binds to `127.0.0.1` only** (it can launch processes, so it is
-never network-exposed).
+never network-exposed). Run modes: Download (merge), Incremental, Repair only,
+Re-run from scratch; plus a separate **Clear existing data** button. Both
+destructive actions list the files that will be deleted and require typing DELETE.
 
 ## Research universe
 
@@ -81,7 +87,8 @@ it'll be considered for a future release.
 |------|---------|
 | `download.py` | Tick downloader + OHLC compiler (the core) |
 | `dashboard.py` | Local web UI to trigger downloads and watch live progress |
-| `check_integrity.py` | Validate compiled CSVs (gaps, ordering, bad bars) |
+| `ledger.py` | Session calendar + per-symbol fetch ledger used by the downloader and the checker |
+| `check_integrity.py` | Validate compiled CSVs (gaps, ordering, bad bars, ledger completeness) |
 | `make_manifest.py` | Write `DATA_MANIFEST.md` — local inventory of what's on disk |
 | `queue_extra_downloads.sh` | Wait for an in-flight run to finish, then fetch more symbols |
 | `download_20y_batch.sh` | Batch helper for long multi-symbol pulls |
