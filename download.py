@@ -43,9 +43,14 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 import numpy as np
 import pandas as pd
+
+from ledger import (FETCH_TO_LEDGER, group_runs, hour_ts, last_attempted_date,
+                    ledger_path, load_ledger, repair_work, save_ledger, seed_from_h1,
+                    session_days, session_hours)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -76,11 +81,13 @@ SYMBOLS = [
 DEFAULT_YEARS = 5
 DAY_WORKERS = 3    # parallel days downloading at once (bumped from 2 → 3*2=6 concurrent, watch for 503s)
 HOUR_WORKERS = 2   # parallel hours within each day (3*2=6 max concurrent requests; ~upper edge of ~5-10 req/s limit)
+RETRY_DELAYS = (2, 4, 8, 16, 32, 60)   # seconds between attempts -> 7 attempts, ~2 min (503s come in ~60s bursts)
 
 BASE_DIR     = Path(__file__).parent
 RAW_DIR      = BASE_DIR / "raw"
 COMPILED_DIR = BASE_DIR / "compiled"
 LOG_DIR      = BASE_DIR / "logs"
+LEDGER_DIR   = BASE_DIR / "ledger"
 META_FILE    = BASE_DIR / ".download_meta.json"
 STATUS_FILE  = BASE_DIR / ".download_status.json"
 
@@ -202,27 +209,25 @@ def get_point_divider(pair: str) -> int:
     return 1000 if (pair in JPY_PAIRS or pair in DIV_1000_INSTRUMENTS) else 100000
 
 
-def _trading_days(start: datetime.date, end: datetime.date):
-    """Yield weekdays (Mon-Fri) in [start, end)."""
-    d = start
-    while d < end:
-        if d.weekday() < 5:
-            yield d
-        d += datetime.timedelta(days=1)
-
-
 # ---------------------------------------------------------------------------
 # Download & Decode
 # ---------------------------------------------------------------------------
 
-def download_hour_bi5(pair: str, dt: datetime.datetime, retries: int = 4) -> bytes | None:
-    """Download a single hour's tick bi5 file with exponential backoff."""
+class FetchResult(NamedTuple):
+    status: str                 # "data" | "empty" | "notfound" | "failed"
+    data: Optional[bytes]
+
+
+def download_hour_bi5(pair: str, dt: datetime.datetime,
+                      delays: tuple = RETRY_DELAYS) -> FetchResult:
+    """Download one hour's bi5 file. Retries transient errors along `delays`."""
     month_0idx = dt.month - 1
     url = (
         f"{BASE_URL}/{pair}/{dt.year}/{month_0idx:02d}/"
         f"{dt.day:02d}/{dt.hour:02d}h_ticks.bi5"
     )
-    for attempt in range(retries):
+    attempts = len(delays) + 1
+    for attempt in range(attempts):
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         t0 = time.perf_counter()
         try:
@@ -232,33 +237,25 @@ def download_hour_bi5(pair: str, dt: datetime.datetime, retries: int = 4) -> byt
             PERF.add("net_seconds", time.perf_counter() - t0)
             if len(data) == 0:
                 PERF.add("http_empty")
-                return None
+                return FetchResult("empty", None)
             PERF.add("bytes_downloaded", len(data))
-            return data
+            return FetchResult("data", data)
         except urllib.error.HTTPError as e:
             PERF.add("net_seconds", time.perf_counter() - t0)
             if e.code == 404:
                 PERF.add("http_404")
-                return None
-            PERF.add("http_retries")
-            if attempt < retries - 1:
-                delay = 2 ** attempt + 1  # 2s, 3s, 5s, 9s
-                time.sleep(delay)
-                continue
-            PERF.add("http_failures")
-            log.debug(f"HTTP {e.code} after {retries} retries: {url}")
-            return None
+                return FetchResult("notfound", None)
+            err = f"HTTP {e.code}"
         except Exception as e:
             PERF.add("net_seconds", time.perf_counter() - t0)
-            PERF.add("http_retries")
-            if attempt < retries - 1:
-                delay = 2 ** attempt + 1
-                time.sleep(delay)
-                continue
-            PERF.add("http_failures")
-            log.debug(f"Failed after {retries} retries: {url} — {e}")
-            return None
-    return None
+            err = repr(e)
+        PERF.add("http_retries")
+        if attempt < attempts - 1:
+            time.sleep(delays[attempt])
+            continue
+        PERF.add("http_failures")
+        log.debug(f"{err} after {attempts} attempts: {url}")
+    return FetchResult("failed", None)
 
 
 # bi5 tick record laid out as a numpy structured dtype for vectorized decode.
@@ -327,24 +324,25 @@ def decode_ticks(
     return df
 
 
-def _download_and_decode_hour(pair: str, day: datetime.date, hour: int, point_divider: int) -> pd.DataFrame:
-    """Download + decode a single hour. Used as a thread target."""
-    hour_start = datetime.datetime(
-        day.year, day.month, day.day, hour,
-        tzinfo=datetime.timezone.utc,
-    )
-    data = download_hour_bi5(pair, hour_start)
-    if data is None:
-        return _EMPTY_TICK_DF
-    return decode_ticks(data, hour_start, point_divider)
+def _download_and_decode_hour(pair: str, day: datetime.date, hour: int,
+                              point_divider: int) -> tuple[int, str, pd.DataFrame]:
+    """Download + decode a single hour. Returns (hour, fetch status, ticks)."""
+    hour_start = datetime.datetime(day.year, day.month, day.day, hour,
+                                   tzinfo=datetime.timezone.utc)
+    res = download_hour_bi5(pair, hour_start)
+    if res.data is None:
+        return hour, res.status, _EMPTY_TICK_DF
+    return hour, res.status, decode_ticks(res.data, hour_start, point_divider)
 
 
 def download_day_ticks(
     pair: str,
     day: datetime.date,
     point_divider: int,
-) -> tuple[pd.DataFrame, int]:
-    """Download all 24 hours for one day and return (M5 bars, tick_count).
+    hours: Optional[list] = None,
+) -> tuple[pd.DataFrame, int, dict]:
+    """Download the given hours of one day (default: the session hours for that
+    weekday) and return (M5 bars, tick_count, {hour: fetch status}).
 
     Resamples to M5 inside this function so callers never hold raw ticks for
     more than one day at a time — keeps memory flat regardless of date range.
@@ -352,25 +350,32 @@ def download_day_ticks(
     to a global resample.
     """
     day_t0 = time.perf_counter()
+    if hours is None:
+        hours = list(session_hours(day))
     hour_frames: list[pd.DataFrame] = []
+    status: dict = {}
 
-    with ThreadPoolExecutor(max_workers=HOUR_WORKERS) as pool:
-        futures = {
-            pool.submit(_download_and_decode_hour, pair, day, h, point_divider): h
-            for h in range(24)
-        }
-        for future in as_completed(futures):
-            try:
-                tdf = future.result()
-                if not tdf.empty:
-                    hour_frames.append(tdf)
-            except Exception as e:
-                PERF.add("worker_exceptions")
-                log.debug(f"hour worker exception {pair} {day}: {e}")
+    if hours:
+        with ThreadPoolExecutor(max_workers=HOUR_WORKERS) as pool:
+            futures = {
+                pool.submit(_download_and_decode_hour, pair, day, h, point_divider): h
+                for h in hours
+            }
+            for future in as_completed(futures):
+                h = futures[future]
+                try:
+                    _, st, tdf = future.result()
+                    status[h] = st
+                    if not tdf.empty:
+                        hour_frames.append(tdf)
+                except Exception as e:
+                    PERF.add("worker_exceptions")
+                    status[h] = "failed"
+                    log.debug(f"hour worker exception {pair} {day} {h:02d}h: {e}")
 
     if not hour_frames:
         PERF.record_day(time.perf_counter() - day_t0)
-        return _EMPTY_M5_DF.copy(), 0
+        return _EMPTY_M5_DF.copy(), 0, status
 
     ticks_df = pd.concat(hour_frames, ignore_index=True)
     tick_count = len(ticks_df)
@@ -381,7 +386,7 @@ def download_day_ticks(
 
     del ticks_df, hour_frames
     PERF.record_day(time.perf_counter() - day_t0)
-    return m5, tick_count
+    return m5, tick_count, status
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +489,7 @@ def download_symbol(
         existing_df = pd.read_csv(existing_m5, parse_dates=["time"])
         log.info(f"  [{pair}] Incremental: {start} -> {end} (have data through {last_date})")
 
-    days = list(_trading_days(start, end))
+    days = list(session_days(start, end))
     if not days:
         log.info(f"  [{pair}] No trading days in range")
         return existing_df
@@ -520,7 +525,7 @@ def download_symbol(
         for future in as_completed(futures):
             day = futures[future]
             try:
-                day_m5, day_tick_count = future.result()
+                day_m5, day_tick_count, _ = future.result()
                 if not day_m5.empty:
                     m5_frames.append(day_m5)
                 ticks_total += day_tick_count
