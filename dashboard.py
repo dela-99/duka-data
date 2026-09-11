@@ -11,7 +11,11 @@ Endpoints (all served by Python's built-in http.server):
     GET  /config      -> selectable symbol universe + default dates
     GET  /status      -> contents of .download_status.json (live progress)
     GET  /log?n=200   -> tail of the most recent logs/*.log file
-    POST /start       -> launch download.py detached (refused if one is running)
+    GET  /files?symbols=A,B -> existing compiled/ledger files + sizes per symbol
+    POST /start       -> launch download.py detached in the given mode
+                         (download|incremental|repair|fresh); refused if one is running
+    POST /clear       -> launch download.py --clear --yes for the given symbols
+                         (the UI's backup modal is the confirmation)
 
 Security: binds to 127.0.0.1 ONLY. Because /start executes a subprocess, this
 must never be exposed to a network. Symbols/dates are validated before use and
@@ -38,6 +42,18 @@ BASE_DIR    = Path(__file__).parent.resolve()
 DOWNLOAD_PY = BASE_DIR / "download.py"
 LOG_DIR     = BASE_DIR / "logs"
 STATUS_FILE = BASE_DIR / ".download_status.json"
+COMPILED_DIR = BASE_DIR / "compiled"
+LEDGER_DIR   = BASE_DIR / "ledger"
+TIMEFRAMES   = ("M5", "H1", "H4", "D1")
+
+# Run mode -> extra argv for download.py. "fresh" passes --yes because the
+# detached child has no TTY; the dashboard's backup modal is the confirmation.
+MODES: dict[str, list[str]] = {
+    "download":    [],
+    "incremental": ["--incremental"],
+    "repair":      ["--repair"],
+    "fresh":       ["--fresh", "--yes"],
+}
 
 # Selectable universe shown in the UI. Labels are presentation-only; the symbol
 # is what gets passed to download.py (Dukascopy datafeed name).
@@ -99,50 +115,89 @@ def tail_log(n: int = 200) -> dict:
     return {"file": path.name, "lines": lines}
 
 
-def start_download(payload: dict) -> dict:
-    """Validate payload and launch download.py detached. Returns a result dict."""
-    if running_download_pids():
-        return {"ok": False, "error": "A download is already running. Wait for it to finish."}
-
+def _validate_symbols(payload: dict):
     symbols = payload.get("symbols") or []
     if not isinstance(symbols, list) or not symbols:
-        return {"ok": False, "error": "Select at least one symbol."}
+        return None, "Select at least one symbol."
     symbols = [str(s).upper() for s in symbols]
     bad = [s for s in symbols if not SYMBOL_RE.match(s)]
     if bad:
-        return {"ok": False, "error": f"Invalid symbol(s): {', '.join(bad)}"}
+        return None, f"Invalid symbol(s): {', '.join(bad)}"
+    return symbols, None
 
-    incremental = bool(payload.get("incremental"))
-    start = str(payload.get("start", "")).strip()
-    end = str(payload.get("end", "")).strip()
-    try:
-        datetime.date.fromisoformat(start)
-        datetime.date.fromisoformat(end)
-    except ValueError:
-        return {"ok": False, "error": "start/end must be valid YYYY-MM-DD dates."}
-    if start >= end:
-        return {"ok": False, "error": "start date must be before end date."}
 
-    cmd = [sys.executable, "-u", str(DOWNLOAD_PY),
-           "--symbols", *symbols, "--start", start, "--end", end]
-    if incremental:
-        cmd.append("--incremental")
-
+def _launch(cmd: list, tag: str) -> dict:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = LOG_DIR / f"dashboard_run_{ts}.log"
     logf = open(log_path, "ab")
-    logf.write(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] launching: "
+    logf.write(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] launching ({tag}): "
                f"{' '.join(cmd)}\n".encode())
     logf.flush()
-
     # start_new_session detaches the child so it survives the dashboard exiting.
-    proc = subprocess.Popen(
-        cmd, stdout=logf, stderr=subprocess.STDOUT,
-        cwd=str(BASE_DIR), start_new_session=True,
-    )
-    return {"ok": True, "pid": proc.pid, "log": log_path.name,
-            "cmd": " ".join(cmd)}
+    proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                            cwd=str(BASE_DIR), start_new_session=True)
+    return {"ok": True, "pid": proc.pid, "log": log_path.name, "cmd": " ".join(cmd), "mode": tag}
+
+
+def start_download(payload: dict) -> dict:
+    """Validate payload and launch download.py detached in the requested mode."""
+    if running_download_pids():
+        return {"ok": False, "error": "A download is already running. Wait for it to finish."}
+    symbols, err = _validate_symbols(payload)
+    if err:
+        return {"ok": False, "error": err}
+    mode = str(payload.get("mode") or "download")
+    if mode not in MODES:
+        return {"ok": False, "error": f"Unknown mode '{mode}'. Use one of: {', '.join(MODES)}."}
+
+    start = str(payload.get("start", "")).strip()
+    end = str(payload.get("end", "")).strip()
+    date_args: list = []
+    if mode == "repair" and not start and not end:
+        pass                                    # whole ledger range
+    else:
+        try:
+            datetime.date.fromisoformat(start)
+            datetime.date.fromisoformat(end)
+        except ValueError:
+            return {"ok": False, "error": "start/end must be valid YYYY-MM-DD dates."}
+        if start >= end:
+            return {"ok": False, "error": "start date must be before end date."}
+        date_args = ["--start", start, "--end", end]
+
+    cmd = [sys.executable, "-u", str(DOWNLOAD_PY), "--symbols", *symbols, *date_args, *MODES[mode]]
+    return _launch(cmd, mode)
+
+
+def clear_data(payload: dict) -> dict:
+    """Launch download.py --clear --yes for the given symbols (UI already confirmed)."""
+    if running_download_pids():
+        return {"ok": False, "error": "A download is already running. Wait for it to finish."}
+    symbols, err = _validate_symbols(payload)
+    if err:
+        return {"ok": False, "error": err}
+    cmd = [sys.executable, "-u", str(DOWNLOAD_PY), "--clear", "--yes", "--symbols", *symbols]
+    return _launch(cmd, "clear")
+
+
+def list_files(symbols: list) -> dict:
+    """Existing compiled CSVs and ledger per symbol with byte sizes."""
+    out: dict = {}
+    for s in symbols:
+        s = str(s).upper()
+        if not SYMBOL_RE.match(s):
+            raise ValueError(f"invalid symbol {s!r}")
+        files = []
+        for tf in TIMEFRAMES:
+            p = COMPILED_DIR / f"{s}_{tf}.csv"
+            if p.exists():
+                files.append({"file": f"compiled/{p.name}", "bytes": p.stat().st_size})
+        lp = LEDGER_DIR / f"{s}.csv"
+        if lp.exists():
+            files.append({"file": f"ledger/{lp.name}", "bytes": lp.stat().st_size})
+        out[s] = files
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +241,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/log":
             n = int(qs.get("n", ["200"])[0])
             self._json(tail_log(max(1, min(n, 2000))))
+        elif path == "/files":
+            syms = [s for s in qs.get("symbols", [""])[0].split(",") if s]
+            try:
+                self._json(list_files(syms))
+            except ValueError as e:
+                self._json({"error": str(e)}, 400)
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
@@ -193,7 +254,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         route = urlparse(self.path)
-        if route.path != "/start":
+        handlers = {"/start": start_download, "/clear": clear_data}
+        fn = handlers.get(route.path)
+        if fn is None:
             self._json({"error": "not found"}, 404)
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -202,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json({"ok": False, "error": "bad JSON body"}, 400)
             return
-        result = start_download(payload)
+        result = fn(payload)
         self._json(result, 200 if result.get("ok") else 409)
 
 
@@ -266,6 +329,24 @@ INDEX_HTML = r"""<!doctype html>
             font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; color:#b8c4d0;
             max-height:340px; overflow:auto; white-space:pre-wrap; margin:0; }
   .hint { color:var(--mut); font-size:12px; margin-top:6px; }
+  .modes { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+  .modes label { display:inline-flex; align-items:center; gap:6px; padding:6px 10px;
+                 border:1px solid var(--line); border-radius:8px; cursor:pointer; font-size:13px; }
+  .modes label:has(input:checked) { border-color:var(--accent); background:#13233d; }
+  .modes .danger:has(input:checked) { border-color:var(--err); background:#3a1417; }
+  button.secondary { background:transparent; border:1px solid var(--err); color:var(--err); }
+  .badge.warn { background:#3a2a0f; color:#ffd27c; }
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none;
+              align-items:center; justify-content:center; z-index:10; }
+  .modal-bg.show { display:flex; }
+  .modal { background:var(--panel); border:1px solid var(--err); border-radius:12px;
+           padding:22px; max-width:560px; width:92%; }
+  .modal h3 { margin:0 0 10px; color:var(--err); font-size:15px; }
+  .modal pre { background:#0b0e12; border:1px solid var(--line); border-radius:8px; padding:10px;
+               font:12px/1.4 ui-monospace,Menlo,monospace; max-height:200px; overflow:auto; margin:8px 0; }
+  .modal input[type=text] { width:100%; background:var(--bg); border:1px solid var(--line);
+               color:var(--fg); border-radius:7px; padding:8px; font-size:14px; margin:8px 0; }
+  .modal .actions { display:flex; gap:10px; justify-content:flex-end; }
 </style>
 </head>
 <body>
@@ -278,14 +359,20 @@ INDEX_HTML = r"""<!doctype html>
   <section class="panel">
     <h2>Start a download</h2>
     <div id="groups"></div>
+    <div class="modes" id="modes">
+      <label><input type="radio" name="mode" value="download" checked> Download (merge)</label>
+      <label><input type="radio" name="mode" value="incremental"> Incremental</label>
+      <label><input type="radio" name="mode" value="repair"> Repair only</label>
+      <label class="danger"><input type="radio" name="mode" value="fresh"> Re-run from scratch</label>
+    </div>
     <div class="row">
       <label class="field"><span>Start</span><input type="date" id="start"></label>
       <label class="field"><span>End</span><input type="date" id="end"></label>
-      <label class="chip"><input type="checkbox" id="incremental"> Incremental</label>
-      <button id="go">Start download</button>
+      <button id="go">Start</button>
+      <button id="clear" class="secondary">Clear existing data…</button>
     </div>
     <div id="msg" class="msg"></div>
-    <div class="hint">Refused if a download is already running. Runs detached — safe to close this tab.</div>
+    <div class="hint" id="modehint">Merges new hours into existing data. Refused if a download is already running. Runs detached — safe to close this tab.</div>
   </section>
 
   <section class="panel">
@@ -300,6 +387,20 @@ INDEX_HTML = r"""<!doctype html>
     <pre id="log">…</pre>
   </section>
 </main>
+
+<div class="modal-bg" id="modal">
+  <div class="modal">
+    <h3 id="mtitle">Delete existing data?</h3>
+    <div id="mbody">The following files will be deleted. This cannot be undone — the data can only be recovered by re-downloading it.</div>
+    <pre id="mfiles">…</pre>
+    <div class="hint">Back up first if you need them, e.g.<br><code id="mbackup">cp -r compiled ledger ~/duka-backup</code></div>
+    <input type="text" id="mconfirm" placeholder="Type DELETE to enable the button" autocomplete="off">
+    <div class="actions">
+      <button id="mcancel" class="secondary">Cancel</button>
+      <button id="mok" disabled>Delete</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -331,24 +432,74 @@ async function loadConfig(){
 
 function chosen(){ return [...document.querySelectorAll('#groups input:checked')].map(i=>i.value); }
 
-$('go').onclick = async () => {
-  const m=$('msg'); m.className='msg'; m.textContent='Starting…'; $('go').disabled=true;
+const MODE_HINTS = {
+  download: 'Merges new hours into existing data.',
+  incremental: 'Fetches only days after the last attempted day in the ledger.',
+  repair: 'Re-fetches hours that failed or were never attempted. Dates optional (narrow the range).',
+  fresh: 'DELETES the selected symbols\' compiled files and ledger, then downloads the range.',
+};
+const mode = () => document.querySelector('#modes input:checked').value;
+document.querySelectorAll('#modes input').forEach(i => i.onchange = () => {
+  $('modehint').textContent = MODE_HINTS[mode()] + ' Refused if a download is already running.';
+});
+
+function fmtBytes(b){ return b>=1048576 ? (b/1048576).toFixed(1)+' MB' : b>=1024 ? (b/1024).toFixed(1)+' KB' : b+' B'; }
+
+async function confirmDelete(symbols, title){
+  const files = await (await fetch('/files?symbols='+encodeURIComponent(symbols.join(',')))).json();
+  const lines = [];
+  for(const [s, fs] of Object.entries(files)){
+    if(!fs.length){ lines.push(`${s}: (no files)`); continue; }
+    for(const f of fs) lines.push(`${f.file.padEnd(32)} ${fmtBytes(f.bytes)}`);
+  }
+  $('mtitle').textContent = title;
+  $('mfiles').textContent = lines.join('\n');
+  $('mbackup').textContent = `cp -r compiled ledger ~/duka-backup-${new Date().toISOString().slice(0,10)}`;
+  $('mconfirm').value=''; $('mok').disabled=true;
+  $('modal').classList.add('show'); $('mconfirm').focus();
+  return new Promise(resolve => {
+    const done = v => { $('modal').classList.remove('show'); resolve(v); };
+    $('mconfirm').oninput = () => { $('mok').disabled = $('mconfirm').value.trim() !== 'DELETE'; };
+    $('mcancel').onclick = () => done(false);
+    $('mok').onclick = () => done(true);
+  });
+}
+
+async function post(url, body, btn){
+  const m=$('msg'); m.className='msg'; m.textContent='Starting…'; btn.disabled=true;
   try{
-    const r = await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({symbols:chosen(),start:$('start').value,end:$('end').value,
-        incremental:$('incremental').checked})});
+    const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const j = await r.json();
-    if(j.ok){ m.className='msg ok'; m.textContent=`Started (PID ${j.pid}) → ${j.log}`; }
+    if(j.ok){ m.className='msg ok'; m.textContent=`Started ${j.mode} (PID ${j.pid}) → ${j.log}`; }
     else { m.className='msg err'; m.textContent=j.error||'Failed to start.'; }
   }catch(e){ m.className='msg err'; m.textContent=String(e); }
-  $('go').disabled=false;
+  btn.disabled=false;
+}
+
+$('go').onclick = async () => {
+  const symbols = chosen(), md = mode();
+  if(!symbols.length){ $('msg').className='msg err'; $('msg').textContent='Select at least one symbol.'; return; }
+  if(md==='fresh' && !(await confirmDelete(symbols, `Re-run from scratch: delete data for ${symbols.join(', ')}?`))) return;
+  await post('/start', {symbols, start:$('start').value, end:$('end').value, mode:md}, $('go'));
+};
+
+$('clear').onclick = async () => {
+  const symbols = chosen();
+  if(!symbols.length){ $('msg').className='msg err'; $('msg').textContent='Select at least one symbol.'; return; }
+  if(!(await confirmDelete(symbols, `Clear existing data for ${symbols.join(', ')}?`))) return;
+  await post('/clear', {symbols}, $('clear'));
 };
 
 function renderStatus(s){
   const running = (s._running_pids||[]).length>0;
   const state = running ? 'running' : (s.state||'idle');
-  const b=$('state'); b.textContent=state; b.className='badge '+state;
-  $('sub').textContent = s.date_range ? s.date_range : '';
+  const lost = Number(s.hours_lost||0);
+  const b=$('state');
+  if(!running && state==='completed' && lost>0){
+    b.textContent=`completed · ${lost} hours lost`; b.className='badge warn';
+    if(!$('msg').textContent){ $('msg').className='msg err'; $('msg').textContent=`${lost} hour(s) lost after retries. Run "Repair only" for these symbols.`; }
+  } else { b.textContent=state; b.className='badge '+state; }
+  $('sub').textContent = (s.date_range||'') + (s.mode?` · ${s.mode}`:'');
 
   const done=s.days_completed, tot=s.days_total;
   if(tot){
@@ -362,12 +513,13 @@ function renderStatus(s){
   const st=[
     ['Ticks', fmt(s.ticks_total)], ['Rate', s.rate_days_per_sec!=null?s.rate_days_per_sec+' d/s':'—'],
     ['ETA', eta(s.eta_minutes)], ['Retries', fmt(s.http_retries)],
-    ['Failures', fmt(s.http_failures)], ['Downloaded', s.bytes_downloaded_mb!=null?s.bytes_downloaded_mb+' MB':'—'],
+    ['Failures', fmt(s.http_failures)], ['Hours lost', fmt(s.hours_lost)], ['Hours empty', fmt(s.hours_empty)],
+    ['Downloaded', s.bytes_downloaded_mb!=null?s.bytes_downloaded_mb+' MB':'—'],
     ['RSS peak', s.rss_peak_mb!=null?s.rss_peak_mb+' MB':'—'], ['Day p95', s.day_p95_seconds!=null?s.day_p95_seconds+'s':'—'],
     ['Updated', updatedAgo],
   ];
   $('stats').innerHTML = st.map(([k,v])=>`<div class="stat"><b>${k}</b>${v}</div>`).join('');
-  $('go').disabled = running;
+  $('go').disabled = running; $('clear').disabled = running;
 }
 
 async function pollStatus(){ try{ renderStatus(await (await fetch('/status')).json()); }catch(e){} }
