@@ -148,3 +148,129 @@ def test_run_returns_total_lost_and_writes_status(feed, data_dirs):
     st = read_status(data_dirs)
     assert st["state"] == "completed" and st["hours_lost"] == 2 and st["mode"] == "download"
     assert st["lost_hours"] == ["2024-03-05T07:00:00Z", "2024-03-06T09:00:00Z"]
+
+
+# ---- Task 4: repair / incremental / clear / fresh / CLI -------------------
+import io
+
+
+def seed_h1_only(data_dirs, days):
+    """Legacy layout: compiled H1 (and M5) but no ledger."""
+    rows = []
+    for d in days:
+        for h in range(24):
+            rows.append({"time": f"{d} {h:02d}:00:00+00:00", "open": 1, "high": 1, "low": 1,
+                         "close": 1, "volume": 1, "spread": 0})
+    df = pd.DataFrame(rows)
+    df.to_csv(data_dirs["compiled"] / "EURUSD_H1.csv", index=False)
+    df.to_csv(data_dirs["compiled"] / "EURUSD_M5.csv", index=False)
+
+
+def test_repair_without_ledger_seeds_and_fetches_gaps(feed, data_dirs):
+    mon, tue = datetime.date(2024, 3, 4), datetime.date(2024, 3, 5)
+    seed_h1_only(data_dirs, [mon, tue])
+    # remove one hour from the legacy files -> a never-attempted hour
+    for tf in ("H1", "M5"):
+        p = data_dirs["compiled"] / f"EURUSD_{tf}.csv"
+        df = pd.read_csv(p)
+        df[df["time"] != "2024-03-04 07:00:00+00:00"].to_csv(p, index=False)
+    D.download_symbol("EURUSD", None, None, repair=True)
+    assert feed.calls == [(mon, 7)]
+    led = L.load_ledger(L.ledger_path(data_dirs["ledger"], "EURUSD"))
+    assert led[L.hour_ts(mon, 7)] == "D" and led[L.hour_ts(mon, 6)] == "D"
+    assert len(led) == 48
+
+
+def test_repair_with_ledger_fetches_only_failed(feed, data_dirs):
+    tue = datetime.date(2024, 3, 5)
+    feed.set(tue, 7, "fail")
+    run_week()
+    feed.script.clear(); feed.calls.clear()
+    m5, lost = D.download_symbol("EURUSD", None, None, repair=True)
+    assert feed.calls == [(tue, 7)] and lost == []
+    assert len(m5) == 5 * 288
+    led = L.load_ledger(L.ledger_path(data_dirs["ledger"], "EURUSD"))
+    assert led[L.hour_ts(tue, 7)] == "D"
+
+
+def test_repair_nothing_to_do_without_any_data(feed, data_dirs):
+    m5, lost = D.download_symbol("EURUSD", None, None, repair=True)
+    assert m5 is None and lost == [] and feed.calls == []
+
+
+def test_incremental_starts_after_ledger(feed, data_dirs):
+    run_week()
+    feed.calls.clear()
+    D.download_symbol("EURUSD", WEEK_START, datetime.date(2024, 3, 12), incremental=True)
+    assert feed.calls, "incremental run should fetch the new days"
+    assert all(c[0] >= datetime.date(2024, 3, 9) for c in feed.calls)
+
+
+def test_symbol_data_files_and_delete(feed, data_dirs):
+    run_week()
+    files = D.symbol_data_files("EURUSD")
+    assert {p.name for p in files} == {"EURUSD_M5.csv", "EURUSD_H1.csv", "EURUSD_H4.csv",
+                                       "EURUSD_D1.csv", "EURUSD.csv"}
+    (data_dirs["compiled"] / "GBPUSD_M5.csv").write_text("x")
+    (data_dirs["compiled"] / "all_pairs_M5.csv").write_text("x")
+    deleted = D.delete_symbol_data(["EURUSD"])
+    assert len(deleted) == 5
+    assert not (data_dirs["compiled"] / "EURUSD_M5.csv").exists()
+    assert (data_dirs["compiled"] / "GBPUSD_M5.csv").exists()
+    assert (data_dirs["compiled"] / "all_pairs_M5.csv").exists()
+
+
+def test_confirm_delete_requires_literal_DELETE(feed, data_dirs, capsys):
+    run_week()
+    class TTY(io.StringIO):
+        def isatty(self): return True
+    assert D.confirm_delete(["EURUSD"], assume_yes=False, stdin=TTY("DELETE\n")) is True
+    assert D.confirm_delete(["EURUSD"], assume_yes=False, stdin=TTY("yes\n")) is False
+    out = capsys.readouterr().out
+    assert "EURUSD_M5.csv" in out and ("MB" in out or "KB" in out)
+    assert "This cannot be undone. Back up compiled/ and ledger/ first if you need them" in out
+    assert "Type DELETE to continue:" in out
+
+
+def test_confirm_delete_non_tty_without_yes_aborts(feed, data_dirs, capsys):
+    run_week()
+    assert D.confirm_delete(["EURUSD"], assume_yes=False, stdin=io.StringIO("DELETE\n")) is False
+    assert "--yes" in capsys.readouterr().out
+    assert D.confirm_delete(["EURUSD"], assume_yes=True, stdin=io.StringIO("")) is True
+
+
+def test_clear_symbols_exit_codes(feed, data_dirs, monkeypatch):
+    run_week()
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    assert D.clear_symbols(["EURUSD"], assume_yes=False) == 2
+    assert (data_dirs["compiled"] / "EURUSD_M5.csv").exists()
+    feed.calls.clear()
+    assert D.clear_symbols(["EURUSD"], assume_yes=True) == 0
+    assert not (data_dirs["compiled"] / "EURUSD_M5.csv").exists()
+    assert not L.ledger_path(data_dirs["ledger"], "EURUSD").exists()
+    assert feed.calls == []
+
+
+def test_cli_mutually_exclusive_modes():
+    p = D.build_parser()
+    for combo in (["--repair", "--incremental"], ["--repair", "--fresh"], ["--clear", "--fresh"],
+                  ["--clear", "--incremental"]):
+        with pytest.raises(SystemExit):
+            p.parse_args(combo)
+    a = p.parse_args(["--clear", "--yes", "--symbols", "EURUSD"])
+    assert a.clear and a.yes and a.symbols == ["EURUSD"]
+
+
+def test_main_exit_codes(feed, data_dirs, monkeypatch):
+    base = ["--symbols", "EURUSD", "--start", "2024-03-04", "--end", "2024-03-09"]
+    assert D.main(base) == 0
+    feed.set(datetime.date(2024, 3, 5), 7, "fail")
+    assert D.main(base) == 1
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    assert D.main(["--fresh", "--symbols", "EURUSD", "--start", "2024-03-04", "--end", "2024-03-09"]) == 2
+    assert (data_dirs["compiled"] / "EURUSD_M5.csv").exists()
+    feed.script.clear(); feed.calls.clear()
+    assert D.main(["--fresh", "--yes"] + base) == 0
+    assert len(feed.calls) == 5 * 24          # everything re-fetched after deletion
+    assert D.main(["--clear", "--yes", "--symbols", "EURUSD"]) == 0
+    assert not (data_dirs["compiled"] / "EURUSD_M5.csv").exists()

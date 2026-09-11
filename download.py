@@ -783,47 +783,115 @@ def run(
 
 
 # ---------------------------------------------------------------------------
+# Destructive actions (--clear / --fresh)
+# ---------------------------------------------------------------------------
+
+def symbol_data_files(pair: str) -> list:
+    """Existing compiled CSVs and the ledger for one symbol."""
+    paths = [COMPILED_DIR / f"{pair}_{tf}.csv" for tf in ("M5", "H1", "H4", "D1")]
+    paths.append(ledger_path(LEDGER_DIR, pair))
+    return [p for p in paths if p.exists()]
+
+
+def confirm_delete(symbols: list, assume_yes: bool, stdin=None, out=print) -> bool:
+    """Print what will be deleted plus a backup reminder; require the literal
+    word DELETE unless assume_yes. Never deletes on a silent default."""
+    stdin = stdin if stdin is not None else sys.stdin
+    files = [p for s in symbols for p in symbol_data_files(s)]
+    out(f"About to DELETE compiled data and ledger for {', '.join(symbols)}:")
+    if not files:
+        out("  (no files found)")
+    for p in files:
+        try:
+            rel = p.relative_to(BASE_DIR)
+        except ValueError:
+            rel = p
+        out(f"  {str(rel):<40} {_fmt_bytes(p.stat().st_size):>10}")
+    out("This cannot be undone. Back up compiled/ and ledger/ first if you need them")
+    out(f"(e.g. cp -r compiled ledger ~/duka-backup-{datetime.date.today()}).")
+    if assume_yes:
+        out("--yes given: skipping confirmation.")
+        return True
+    if not getattr(stdin, "isatty", lambda: False)():
+        out("stdin is not a terminal; pass --yes to confirm non-interactively. Aborting.")
+        return False
+    out("Type DELETE to continue:")
+    answer = stdin.readline().strip()
+    if answer != "DELETE":
+        out("Aborted. Nothing was deleted.")
+        return False
+    return True
+
+
+def delete_symbol_data(symbols: list) -> list:
+    deleted = []
+    for s in symbols:
+        for p in symbol_data_files(s):
+            p.unlink()
+            deleted.append(p)
+    return deleted
+
+
+def clear_symbols(symbols: list, assume_yes: bool) -> int:
+    """--clear entry point. Returns an exit code."""
+    if not confirm_delete(symbols, assume_yes):
+        return 2
+    deleted = delete_symbol_data(symbols)
+    for p in deleted:
+        log.info(f"deleted {p}")
+    log.info(f"Cleared {len(deleted)} file(s) for {', '.join(symbols)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download Dukascopy tick data and compile to OHLC bars",
+        epilog="Exit codes: 0 ok, 1 hours still lost after retries (run --repair), "
+               "2 destructive action aborted.",
     )
-    parser.add_argument(
-        "--symbols", nargs="+", default=SYMBOLS,
-        help=f"Pairs to download (default: {' '.join(SYMBOLS)})",
-    )
-    parser.add_argument(
-        "--years", type=int, default=DEFAULT_YEARS,
-        help=f"Years of history (default: {DEFAULT_YEARS})",
-    )
-    parser.add_argument(
-        "--start", type=str, default=None,
-        help="Start date override (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--end", type=str, default=None,
-        help="End date override (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--incremental", action="store_true",
-        help="Only download new data since last run",
-    )
-    args = parser.parse_args()
+    parser.add_argument("--symbols", nargs="+", default=SYMBOLS,
+                        help=f"Pairs to download (default: {' '.join(SYMBOLS)})")
+    parser.add_argument("--years", type=int, default=DEFAULT_YEARS,
+                        help=f"Years of history (default: {DEFAULT_YEARS})")
+    parser.add_argument("--start", type=str, default=None, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, default=None, help="End date, exclusive (YYYY-MM-DD)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--incremental", action="store_true",
+                      help="Only download days after the last attempted day in the ledger")
+    mode.add_argument("--repair", action="store_true",
+                      help="Re-fetch hours that failed or were never attempted (ledger-driven); "
+                           "--start/--end narrow the range")
+    mode.add_argument("--fresh", action="store_true",
+                      help="Delete the symbols' compiled files and ledger first, then download")
+    mode.add_argument("--clear", action="store_true",
+                      help="Delete the symbols' compiled files and ledger, then exit")
+    parser.add_argument("--yes", action="store_true",
+                        help="Skip the DELETE confirmation for --fresh/--clear")
+    return parser
 
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    symbols = [s.upper() for s in args.symbols]
     start = datetime.date.fromisoformat(args.start) if args.start else None
     end = datetime.date.fromisoformat(args.end) if args.end else None
 
-    lost = run(
-        symbols=[s.upper() for s in args.symbols],
-        years=args.years,
-        incremental=args.incremental,
-        start_override=start,
-        end_override=end,
-    )
-    sys.exit(1 if lost else 0)
+    if args.clear:
+        return clear_symbols(symbols, args.yes)
+    if args.fresh:
+        if not confirm_delete(symbols, args.yes):
+            return 2
+        for p in delete_symbol_data(symbols):
+            log.info(f"deleted {p}")
+
+    lost = run(symbols=symbols, years=args.years, incremental=args.incremental,
+               start_override=start, end_override=end, repair=args.repair)
+    return 1 if lost else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
