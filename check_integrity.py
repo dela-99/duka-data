@@ -16,13 +16,19 @@ Checks:
  9. Cross-timeframe price consistency (D1 close == last H1 close of day)
 10. M5 -> D1 reconciliation (rebuild daily OHLC from M5, compare to D1 file)
 11. Data freshness (informational)
+12. Session-hour completeness (gated when a ledger exists; informational otherwise)
 
-Correctness checks (1, 4, 5, 6, 7, 9, 10) gate the exit code; coverage /
+Correctness checks (1, 4, 5, 6, 7, 9, 10, 12) gate the exit code; coverage /
 session / freshness checks (2, 3, 8, 11) are informational and never fail the
 run, because history length, session structure and collection cadence are
 properties of the instrument, not defects.
+
+Check 12 is the only one that can see hours the downloader *lost* (e.g. to
+HTTP 503): H1/H4/D1 are resampled from M5, so a missing hour is consistent
+across all four files and invisible to checks 1-11.
 """
 
+import argparse
 import datetime
 from pathlib import Path
 import sys
@@ -30,8 +36,13 @@ import sys
 import pandas as pd
 import numpy as np
 
-COMPILED_DIR = Path(__file__).parent / "compiled"
+from ledger import expected_session_hours, group_runs, ledger_path, load_ledger
+
+BASE_DIR = Path(__file__).parent
+COMPILED_DIR = BASE_DIR / "compiled"
+LEDGER_DIR = BASE_DIR / "ledger"
 TIMEFRAMES = ["M5", "H1", "H4", "D1"]
+SYMBOLS: list = []
 
 # FX pairs quote in pips; CFDs (metals/energy/indices) use other conventions,
 # so pip-based spread bounds and 24h-session expectations apply to FX only.
@@ -57,7 +68,12 @@ def discover_symbols():
     return sorted(syms)
 
 
-SYMBOLS = discover_symbols()
+def configure(data_dir: Path) -> None:
+    """Point the checker at <data_dir>/compiled and <data_dir>/ledger."""
+    global COMPILED_DIR, LEDGER_DIR, SYMBOLS
+    COMPILED_DIR = Path(data_dir) / "compiled"
+    LEDGER_DIR = Path(data_dir) / "ledger"
+    SYMBOLS = discover_symbols()
 
 
 def pip_mult(sym):
@@ -115,13 +131,16 @@ def check_24h_coverage():
 
 
 def check_bar_counts():
-    print("\n[4] Cross-timeframe bar count ratios (M5/H1~12, H1/H4~4, H4/D1~6)")
+    print("\n[4] Cross-timeframe bar count ratios, Mon-Fri bars (M5/H1~12, H1/H4~4, H4/D1~6)")
     print("-" * 60)
     print(f"  {'Symbol':<13} {'M5':>10} {'H1':>9} {'H4':>8} {'D1':>7}  "
           f"{'M5/H1':>6} {'H1/H4':>6} {'H4/D1':>6}")
     issues = 0
     for sym in SYMBOLS:
-        counts = {tf: len(load_df(sym, tf)) for tf in TIMEFRAMES}
+        counts = {}
+        for tf in TIMEFRAMES:
+            df = load_df(sym, tf)
+            counts[tf] = int((df["time"].dt.dayofweek <= 4).sum())   # short Sunday bars excluded
         r1 = counts["M5"] / counts["H1"]
         r2 = counts["H1"] / counts["H4"]
         r3 = counts["H4"] / counts["D1"]
@@ -272,11 +291,49 @@ def check_recent_data():
     for sym in SYMBOLS:
         last = load_df(sym, "M5")["time"].max().date()
         print(f"  {sym:<13} last={last}  ({(today - last).days} days old)")
-    print("  (collection is paused; run `python3 download.py --incremental` to top up)")
+    print("  (run `python3 download.py --incremental` to top up; `--repair` to fill gaps)")
     return True
 
 
-def main():
+def check_session_completeness():
+    print("\n[12] Session-hour completeness (ledger-gated; informational without a ledger)")
+    print("-" * 60)
+    issues = 0
+    for sym in SYMBOLS:
+        ledger = load_ledger(ledger_path(LEDGER_DIR, sym))
+        if ledger:
+            lo, hi = min(ledger), max(ledger)
+            offenders = [h for h in expected_session_hours(lo, hi) if ledger.get(h, "F") == "F"]
+            n_failed = sum(1 for h in offenders if h in ledger)
+            n_never = len(offenders) - n_failed
+            flag = " " if not offenders else "!"
+            issues += 1 if offenders else 0
+            print(f"  {sym:<13} ledger {lo:%Y-%m-%d} .. {hi:%Y-%m-%d}: "
+                  f"{n_failed} failed, {n_never} never attempted  {flag}")
+        else:
+            h1 = load_df(sym, "H1")
+            have = set(pd.to_datetime(h1["time"], utc=True))
+            offenders = [h for h in expected_session_hours(h1["time"].min(), h1["time"].max())
+                         if h not in have]
+            print(f"  {sym:<13} no ledger: {len(offenders):,} expected session hours without an "
+                  f"H1 bar (informational)")
+        runs = group_runs(offenders)
+        for a, b, n in runs[:10]:
+            print(f"      {a:%Y-%m-%d %H:%M} -> {b:%Y-%m-%d %H:%M}  ({n}h)")
+        if len(runs) > 10:
+            print(f"      ... and {len(runs) - 10} more gap runs")
+        if not ledger:
+            print(f"      no ledger: run python3 download.py --repair --symbols {sym} to build one")
+    return issues == 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Validate compiled CSVs and the fetch ledger")
+    ap.add_argument("--data-dir", default=str(BASE_DIR),
+                    help="directory containing compiled/ and ledger/ (default: repo root)")
+    args = ap.parse_args(argv)
+    configure(Path(args.data_dir))
+
     print("=" * 60)
     print("DATA INTEGRITY CHECK")
     print("=" * 60)
@@ -294,6 +351,7 @@ def main():
         ("Price consistency",    check_price_consistency),
         ("M5->D1 reconciliation", check_reconciliation),
         ("Data freshness",       check_recent_data),
+        ("Session-hour completeness", check_session_completeness),
     ]
 
     results = []
