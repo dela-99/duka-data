@@ -115,10 +115,12 @@ with `hours_failed` (give-ups during the main pass), `hours_empty`, and
 |---|---|
 | `--repair` | Fetch only `F` and never-attempted session hours in the covered range |
 | `--fresh` | Delete the symbol's compiled files and ledger first, then download |
+| `--clear` | Delete the selected symbols' compiled files and ledger, then exit without downloading |
 
-`--repair` composes with `--symbols`, `--start`, `--end`. `--repair` and
-`--fresh` are mutually exclusive; `--repair` and `--incremental` are mutually
-exclusive.
+`--repair` composes with `--symbols`, `--start`, `--end`. `--repair`,
+`--fresh`, `--clear`, and `--incremental` are mutually exclusive with each
+other. `--clear` ignores `--start/--end`, prints what it deleted, and never
+touches `all_pairs_M5.csv` (rebuilt by the next full run).
 
 ### 4. Checker (`check_integrity.py`)
 
@@ -143,7 +145,8 @@ exclusive.
   was lost" (`hours_lost` in the progress line / status file, WARNING list).
   Update the Performance and Monitoring sections for the new fields.
 - **README.md:** tooling table mentions the ledger; Quick start notes the
-  non-zero exit and `--repair`.
+  non-zero exit and `--repair`; the Dashboard section lists the run modes and
+  the Clear button.
 - **Backfill (after code lands):** `python3 download.py --repair` for all 14
   symbols; `python3 make_manifest.py`; rewrite `DATA_QUALITY.md` with the new
   completeness numbers (Sunday sessions present, 503 losses repaired, checker
@@ -176,7 +179,11 @@ then `data`) and stubs `time.sleep`. Tests point `COMPILED_DIR`, `LEDGER_DIR`,
 8. Sundays request hours 20–23 only; weekdays request 0–23; Saturdays none.
 9. `run()` returns `hours_lost`; `main()` exit code is 1 when non-zero, 0
    otherwise.
-10. `--repair` with `--incremental` or `--fresh` is rejected by the parser.
+10. Any two of `--repair`, `--fresh`, `--clear`, `--incremental` together are
+    rejected by the parser.
+11. `--clear` deletes the selected symbols' compiled files and ledger, leaves
+    other symbols and `all_pairs_M5.csv` alone, makes no HTTP requests, and
+    exits 0.
 
 `tests/test_check_integrity.py` (uses the gapped-EURUSD builder from the
 investigation, scaled to a few weeks of synthetic M5):
@@ -188,6 +195,49 @@ investigation, scaled to a few weeks of synthetic M5):
    FX ratio bands).
 5. `--data-dir` is honoured.
 
+`tests/test_dashboard.py` (`subprocess.Popen` monkeypatched to capture argv;
+`running_download_pids` monkeypatched):
+
+1. Each `mode` builds the expected argv: `download` → no flag, `incremental` →
+   `--incremental`, `repair` → `--repair`, `fresh` → `--fresh`.
+2. `repair` with empty start/end omits `--start/--end`; other modes still
+   require valid dates.
+3. Unknown `mode` is rejected; missing `mode` defaults to `download`.
+4. `/clear` builds `download.py --clear --symbols ...`, rejects invalid
+   symbols, and is refused while a download is running.
+
+### 7. Dashboard (`dashboard.py`)
+
+The dashboard stays a thin launcher: every action maps to exactly one
+`download.py` invocation, and the dashboard never deletes files itself.
+
+**Run mode.** The Incremental checkbox becomes a radio group:
+
+| Mode | argv addition | Notes |
+|---|---|---|
+| Download (merge) | none | Default. New hours merge into existing data. |
+| Incremental | `--incremental` | Days after the last ledger date only. |
+| Repair only | `--repair` | Date fields optional; if set they narrow the range. |
+| Re-run from scratch | `--fresh` | Browser `confirm()` naming the selected symbols before POST. |
+
+**Clear existing data.** A separate button next to Start, not a run mode. On
+`confirm()` naming the selected symbols, it POSTs to a new `/clear` endpoint,
+which reuses the symbol validation from `start_download` and spawns
+`download.py --clear --symbols ...` detached, logging to the same
+`dashboard_run_*.log` pattern. Refused while a download is running, exactly
+like `/start`.
+
+**Server side.** `start_download` reads `mode` (default `"download"`) and
+validates it against the four allowed values; `start`/`end` validation is
+skipped for `repair` when both are empty. The launch log line includes the
+mode. `/clear` is a second POST route; `do_POST` dispatches on path.
+
+**Progress panel.** Two new stats, *Hours lost* and *Hours empty*, from the
+new status fields. When `state == "completed"` and `hours_lost > 0`, the state
+badge reads `completed · N hours lost` in the warning colour and the message
+area shows "Run *Repair only* for these symbols". The days-based progress bar
+is unchanged; repair runs still report days.
+
 ## Out of scope
 
 - Persisting partial progress if a run is killed mid-symbol (existing
@@ -196,7 +246,8 @@ investigation, scaled to a few weeks of synthetic M5):
 - Changing concurrency (`DAY_WORKERS`, `HOUR_WORKERS`).
 - The `raw/` directory and `all_pairs_M5.csv` generation (unchanged; the
   combined file is rebuilt from the merged per-symbol M5 as today).
-- Dashboard changes beyond reading the renamed status fields (`hours_*`).
+- Dashboard changes beyond section 7 (no per-symbol progress, no log
+  filtering, no ledger browser).
 
 ## Rollout
 
