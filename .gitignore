@@ -2,6 +2,7 @@
 compiled/
 raw/
 logs/
+ledger/
 *.csv
 
 # --- Local state / generated metadata ---
