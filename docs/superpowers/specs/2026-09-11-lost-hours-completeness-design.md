@@ -117,10 +117,33 @@ with `hours_failed` (give-ups during the main pass), `hours_empty`, and
 | `--fresh` | Delete the symbol's compiled files and ledger first, then download |
 | `--clear` | Delete the selected symbols' compiled files and ledger, then exit without downloading |
 
+| `--yes` | Skip the destructive-action confirmation (for scripts and the dashboard) |
+
 `--repair` composes with `--symbols`, `--start`, `--end`. `--repair`,
 `--fresh`, `--clear`, and `--incremental` are mutually exclusive with each
 other. `--clear` ignores `--start/--end`, prints what it deleted, and never
 touches `all_pairs_M5.csv` (rebuilt by the next full run).
+
+**Destructive-action confirmation.** `--clear` and `--fresh` both delete data
+that took hours to download and cannot be recovered except by re-downloading.
+Before deleting, `download.py` prints the exact files it is about to remove
+with their sizes and a backup reminder, then asks for confirmation:
+
+```
+About to DELETE compiled data and ledger for EURUSD, GBPUSD:
+  compiled/EURUSD_M5.csv   98.1 MB
+  compiled/EURUSD_H1.csv    8.4 MB
+  ...
+  ledger/EURUSD.csv         3.9 MB
+This cannot be undone. Back up compiled/ and ledger/ first if you need them
+(e.g. cp -r compiled ledger ~/duka-backup-2026-09-11).
+Type DELETE to continue:
+```
+
+Anything other than the literal `DELETE` aborts with exit 2 and no changes.
+`--yes` skips the prompt but still prints the file list and reminder. If stdin
+is not a TTY and `--yes` is absent, the command aborts with exit 2 and a
+message saying to pass `--yes`; it never deletes on a silent default.
 
 ### 4. Checker (`check_integrity.py`)
 
@@ -181,9 +204,14 @@ then `data`) and stubs `time.sleep`. Tests point `COMPILED_DIR`, `LEDGER_DIR`,
    otherwise.
 10. Any two of `--repair`, `--fresh`, `--clear`, `--incremental` together are
     rejected by the parser.
-11. `--clear` deletes the selected symbols' compiled files and ledger, leaves
-    other symbols and `all_pairs_M5.csv` alone, makes no HTTP requests, and
-    exits 0.
+11. `--clear --yes` deletes the selected symbols' compiled files and ledger,
+    leaves other symbols and `all_pairs_M5.csv` alone, makes no HTTP requests,
+    and exits 0.
+12. `--clear` / `--fresh` on a TTY (stdin monkeypatched): typing `DELETE`
+    proceeds; any other input aborts with exit 2 and every file intact. The
+    printed prompt lists each file with its size and the backup reminder.
+13. `--clear` / `--fresh` with non-TTY stdin and no `--yes` aborts with exit 2,
+    deletes nothing, and the message mentions `--yes`.
 
 `tests/test_check_integrity.py` (uses the gapped-EURUSD builder from the
 investigation, scaled to a few weeks of synthetic M5):
@@ -203,8 +231,11 @@ investigation, scaled to a few weeks of synthetic M5):
 2. `repair` with empty start/end omits `--start/--end`; other modes still
    require valid dates.
 3. Unknown `mode` is rejected; missing `mode` defaults to `download`.
-4. `/clear` builds `download.py --clear --symbols ...`, rejects invalid
+4. `/clear` builds `download.py --clear --yes --symbols ...`, rejects invalid
    symbols, and is refused while a download is running.
+5. `fresh` mode appends `--yes`; no other mode does.
+6. `/files` lists only existing compiled and ledger files for the requested
+   symbols with byte sizes, and rejects invalid symbols.
 
 ### 7. Dashboard (`dashboard.py`)
 
@@ -218,19 +249,32 @@ The dashboard stays a thin launcher: every action maps to exactly one
 | Download (merge) | none | Default. New hours merge into existing data. |
 | Incremental | `--incremental` | Days after the last ledger date only. |
 | Repair only | `--repair` | Date fields optional; if set they narrow the range. |
-| Re-run from scratch | `--fresh` | Browser `confirm()` naming the selected symbols before POST. |
+| Re-run from scratch | `--fresh --yes` | Backup warning dialog (below) before POST. |
 
-**Clear existing data.** A separate button next to Start, not a run mode. On
-`confirm()` naming the selected symbols, it POSTs to a new `/clear` endpoint,
-which reuses the symbol validation from `start_download` and spawns
-`download.py --clear --symbols ...` detached, logging to the same
+**Clear existing data.** A separate button next to Start, not a run mode. After
+the backup warning dialog, it POSTs to a new `/clear` endpoint, which reuses
+the symbol validation from `start_download` and spawns
+`download.py --clear --yes --symbols ...` detached, logging to the same
 `dashboard_run_*.log` pattern. Refused while a download is running, exactly
 like `/start`.
 
+**Backup warning dialog.** Both destructive actions (Clear, Re-run from
+scratch) open the same in-page modal, not a bare `confirm()`. It lists the
+files that will be deleted with sizes (fetched from a new `GET
+/files?symbols=...` endpoint that reports existing compiled and ledger files
+per symbol), states that the data cannot be recovered without re-downloading,
+and shows the backup hint with a copyable command
+(`cp -r compiled ledger ~/duka-backup-<date>`). The confirm button is disabled
+until the user types `DELETE` into a text field, mirroring the CLI. Cancel
+closes the modal with no request sent. The dashboard passes `--yes` because the
+detached child has no TTY; the modal is the confirmation.
+
 **Server side.** `start_download` reads `mode` (default `"download"`) and
 validates it against the four allowed values; `start`/`end` validation is
-skipped for `repair` when both are empty. The launch log line includes the
-mode. `/clear` is a second POST route; `do_POST` dispatches on path.
+skipped for `repair` when both are empty; `fresh` appends `--yes`. The launch
+log line includes the mode. `/clear` is a second POST route and `/files` a new
+GET route; `do_POST`/`do_GET` dispatch on path. `/files` validates symbols the
+same way and returns `{symbol: [{file, bytes}]}` for files that exist.
 
 **Progress panel.** Two new stats, *Hours lost* and *Hours empty*, from the
 new status fields. When `state == "completed"` and `hours_lost > 0`, the state
