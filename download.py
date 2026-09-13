@@ -24,6 +24,7 @@ Output: M5, H1, H4, D1 CSVs with columns:
   time, open, high, low, close, volume, spread
 
 Monitoring: writes real-time status to .download_status.json and logs to logs/
+Ledger: records every attempted hour in ledger/<SYM>.csv (see ledger.py).
 
 Design: Research data acquisition only. No live trading code.
 """
@@ -43,9 +44,14 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 import numpy as np
 import pandas as pd
+
+from ledger import (FETCH_TO_LEDGER, group_runs, hour_ts, last_attempted_date,
+                    ledger_path, load_ledger, repair_work, save_ledger, seed_from_h1,
+                    session_days, session_hours)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -76,11 +82,13 @@ SYMBOLS = [
 DEFAULT_YEARS = 5
 DAY_WORKERS = 3    # parallel days downloading at once (bumped from 2 → 3*2=6 concurrent, watch for 503s)
 HOUR_WORKERS = 2   # parallel hours within each day (3*2=6 max concurrent requests; ~upper edge of ~5-10 req/s limit)
+RETRY_DELAYS = (2, 4, 8, 16, 32, 60)   # seconds between attempts -> 7 attempts, ~2 min (503s come in ~60s bursts)
 
 BASE_DIR     = Path(__file__).parent
 RAW_DIR      = BASE_DIR / "raw"
 COMPILED_DIR = BASE_DIR / "compiled"
 LOG_DIR      = BASE_DIR / "logs"
+LEDGER_DIR   = BASE_DIR / "ledger"
 META_FILE    = BASE_DIR / ".download_meta.json"
 STATUS_FILE  = BASE_DIR / ".download_status.json"
 
@@ -202,27 +210,25 @@ def get_point_divider(pair: str) -> int:
     return 1000 if (pair in JPY_PAIRS or pair in DIV_1000_INSTRUMENTS) else 100000
 
 
-def _trading_days(start: datetime.date, end: datetime.date):
-    """Yield weekdays (Mon-Fri) in [start, end)."""
-    d = start
-    while d < end:
-        if d.weekday() < 5:
-            yield d
-        d += datetime.timedelta(days=1)
-
-
 # ---------------------------------------------------------------------------
 # Download & Decode
 # ---------------------------------------------------------------------------
 
-def download_hour_bi5(pair: str, dt: datetime.datetime, retries: int = 4) -> bytes | None:
-    """Download a single hour's tick bi5 file with exponential backoff."""
+class FetchResult(NamedTuple):
+    status: str                 # "data" | "empty" | "notfound" | "failed"
+    data: Optional[bytes]
+
+
+def download_hour_bi5(pair: str, dt: datetime.datetime,
+                      delays: tuple = RETRY_DELAYS) -> FetchResult:
+    """Download one hour's bi5 file. Retries transient errors along `delays`."""
     month_0idx = dt.month - 1
     url = (
         f"{BASE_URL}/{pair}/{dt.year}/{month_0idx:02d}/"
         f"{dt.day:02d}/{dt.hour:02d}h_ticks.bi5"
     )
-    for attempt in range(retries):
+    attempts = len(delays) + 1
+    for attempt in range(attempts):
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         t0 = time.perf_counter()
         try:
@@ -232,33 +238,25 @@ def download_hour_bi5(pair: str, dt: datetime.datetime, retries: int = 4) -> byt
             PERF.add("net_seconds", time.perf_counter() - t0)
             if len(data) == 0:
                 PERF.add("http_empty")
-                return None
+                return FetchResult("empty", None)
             PERF.add("bytes_downloaded", len(data))
-            return data
+            return FetchResult("data", data)
         except urllib.error.HTTPError as e:
             PERF.add("net_seconds", time.perf_counter() - t0)
             if e.code == 404:
                 PERF.add("http_404")
-                return None
-            PERF.add("http_retries")
-            if attempt < retries - 1:
-                delay = 2 ** attempt + 1  # 2s, 3s, 5s, 9s
-                time.sleep(delay)
-                continue
-            PERF.add("http_failures")
-            log.debug(f"HTTP {e.code} after {retries} retries: {url}")
-            return None
+                return FetchResult("notfound", None)
+            err = f"HTTP {e.code}"
         except Exception as e:
             PERF.add("net_seconds", time.perf_counter() - t0)
-            PERF.add("http_retries")
-            if attempt < retries - 1:
-                delay = 2 ** attempt + 1
-                time.sleep(delay)
-                continue
-            PERF.add("http_failures")
-            log.debug(f"Failed after {retries} retries: {url} — {e}")
-            return None
-    return None
+            err = repr(e)
+        PERF.add("http_retries")
+        if attempt < attempts - 1:
+            time.sleep(delays[attempt])
+            continue
+        PERF.add("http_failures")
+        log.debug(f"{err} after {attempts} attempts: {url}")
+    return FetchResult("failed", None)
 
 
 # bi5 tick record laid out as a numpy structured dtype for vectorized decode.
@@ -327,24 +325,25 @@ def decode_ticks(
     return df
 
 
-def _download_and_decode_hour(pair: str, day: datetime.date, hour: int, point_divider: int) -> pd.DataFrame:
-    """Download + decode a single hour. Used as a thread target."""
-    hour_start = datetime.datetime(
-        day.year, day.month, day.day, hour,
-        tzinfo=datetime.timezone.utc,
-    )
-    data = download_hour_bi5(pair, hour_start)
-    if data is None:
-        return _EMPTY_TICK_DF
-    return decode_ticks(data, hour_start, point_divider)
+def _download_and_decode_hour(pair: str, day: datetime.date, hour: int,
+                              point_divider: int) -> tuple[int, str, pd.DataFrame]:
+    """Download + decode a single hour. Returns (hour, fetch status, ticks)."""
+    hour_start = datetime.datetime(day.year, day.month, day.day, hour,
+                                   tzinfo=datetime.timezone.utc)
+    res = download_hour_bi5(pair, hour_start)
+    if res.data is None:
+        return hour, res.status, _EMPTY_TICK_DF
+    return hour, res.status, decode_ticks(res.data, hour_start, point_divider)
 
 
 def download_day_ticks(
     pair: str,
     day: datetime.date,
     point_divider: int,
-) -> tuple[pd.DataFrame, int]:
-    """Download all 24 hours for one day and return (M5 bars, tick_count).
+    hours: Optional[list] = None,
+) -> tuple[pd.DataFrame, int, dict]:
+    """Download the given hours of one day (default: the session hours for that
+    weekday) and return (M5 bars, tick_count, {hour: fetch status}).
 
     Resamples to M5 inside this function so callers never hold raw ticks for
     more than one day at a time — keeps memory flat regardless of date range.
@@ -352,25 +351,32 @@ def download_day_ticks(
     to a global resample.
     """
     day_t0 = time.perf_counter()
+    if hours is None:
+        hours = list(session_hours(day))
     hour_frames: list[pd.DataFrame] = []
+    status: dict = {}
 
-    with ThreadPoolExecutor(max_workers=HOUR_WORKERS) as pool:
-        futures = {
-            pool.submit(_download_and_decode_hour, pair, day, h, point_divider): h
-            for h in range(24)
-        }
-        for future in as_completed(futures):
-            try:
-                tdf = future.result()
-                if not tdf.empty:
-                    hour_frames.append(tdf)
-            except Exception as e:
-                PERF.add("worker_exceptions")
-                log.debug(f"hour worker exception {pair} {day}: {e}")
+    if hours:
+        with ThreadPoolExecutor(max_workers=HOUR_WORKERS) as pool:
+            futures = {
+                pool.submit(_download_and_decode_hour, pair, day, h, point_divider): h
+                for h in hours
+            }
+            for future in as_completed(futures):
+                h = futures[future]
+                try:
+                    _, st, tdf = future.result()
+                    status[h] = st
+                    if not tdf.empty:
+                        hour_frames.append(tdf)
+                except Exception as e:
+                    PERF.add("worker_exceptions")
+                    status[h] = "failed"
+                    log.debug(f"hour worker exception {pair} {day} {h:02d}h: {e}")
 
     if not hour_frames:
         PERF.record_day(time.perf_counter() - day_t0)
-        return _EMPTY_M5_DF.copy(), 0
+        return _EMPTY_M5_DF.copy(), 0, status
 
     ticks_df = pd.concat(hour_frames, ignore_index=True)
     tick_count = len(ticks_df)
@@ -381,7 +387,7 @@ def download_day_ticks(
 
     del ticks_df, hour_frames
     PERF.record_day(time.perf_counter() - day_t0)
-    return m5, tick_count
+    return m5, tick_count, status
 
 
 # ---------------------------------------------------------------------------
@@ -455,348 +461,437 @@ def save_meta(meta: dict):
 # Main Pipeline
 # ---------------------------------------------------------------------------
 
+def _group_by_day(hours: list) -> list:
+    """[Timestamp,...] -> [(date, [hour,...]), ...] sorted."""
+    by_day: dict = {}
+    for ts in hours:
+        by_day.setdefault(ts.date(), []).append(ts.hour)
+    return [(d, sorted(hs)) for d, hs in sorted(by_day.items())]
+
+
+def _plan_work(pair: str, start, end, ledger: dict, meta: dict,
+               incremental: bool, repair: bool) -> tuple:
+    """Decide which (day, hours) to fetch. Returns (work, mode, note)."""
+    if repair:
+        hours = repair_work(ledger, start, end)
+        return _group_by_day(hours), "repair", None
+    if incremental:
+        last = last_attempted_date(ledger)
+        if last is None and pair in meta:
+            last = datetime.date.fromisoformat(meta[pair]["last_date"])
+        if last is not None:
+            if last >= end - datetime.timedelta(days=1):
+                return [], "incremental", f"Already up to date ({last})"
+            start = last + datetime.timedelta(days=1)
+    mode = "incremental" if incremental else "download"
+    work = [(d, list(session_hours(d))) for d in session_days(start, end)]
+    return work, mode, None
+
+
 def download_symbol(
     pair: str,
-    start: datetime.date,
-    end: datetime.date,
+    start: Optional[datetime.date],
+    end: Optional[datetime.date],
     incremental: bool = False,
+    repair: bool = False,
     symbol_idx: int = 0,
     total_symbols: int = 1,
-) -> pd.DataFrame | None:
-    """Download tick data for a symbol, resample to M5, and save all timeframes."""
+) -> tuple:
+    """Fetch, sweep, merge and save one symbol.
+
+    Returns (merged M5 DataFrame or None, list of hours still lost after the sweep).
+    """
     point_divider = get_point_divider(pair)
     meta = load_meta()
+    ledger_file = ledger_path(LEDGER_DIR, pair)
+    ledger = load_ledger(ledger_file)
+    m5_path = COMPILED_DIR / f"{pair}_M5.csv"
+    h1_path = COMPILED_DIR / f"{pair}_H1.csv"
+    existing_df = pd.read_csv(m5_path, parse_dates=["time"]) if m5_path.exists() else None
 
-    # Incremental: adjust start date
-    existing_m5 = COMPILED_DIR / f"{pair}_M5.csv"
-    existing_df = None
-    if incremental and pair in meta and existing_m5.exists():
-        last_date = datetime.date.fromisoformat(meta[pair]["last_date"])
-        if last_date >= end - datetime.timedelta(days=1):
-            log.info(f"  [{pair}] Already up to date ({last_date})")
-            status_update(
-                current_symbol=pair,
-                symbol_progress=f"{symbol_idx}/{total_symbols}",
-                symbol_status="up_to_date",
-            )
-            return pd.read_csv(existing_m5, parse_dates=["time"])
-        start = last_date + datetime.timedelta(days=1)
-        existing_df = pd.read_csv(existing_m5, parse_dates=["time"])
-        log.info(f"  [{pair}] Incremental: {start} -> {end} (have data through {last_date})")
+    if repair and not ledger:
+        if not h1_path.exists():
+            log.info(f"  [{pair}] Nothing to repair (no ledger and no compiled data)")
+            return existing_df, []
+        ledger = seed_from_h1(h1_path)
+        log.info(f"  [{pair}] Seeded ledger from H1: {len(ledger):,} hours with data")
 
-    days = list(_trading_days(start, end))
-    if not days:
-        log.info(f"  [{pair}] No trading days in range")
-        return existing_df
+    work, mode, note = _plan_work(pair, start, end, ledger, meta, incremental, repair)
+    status_update(current_symbol=pair, symbol_progress=f"{symbol_idx}/{total_symbols}",
+                  mode=mode)
+    if note:
+        log.info(f"  [{pair}] {note}")
+        status_update(symbol_status="up_to_date")
+        return existing_df, []
+    if not work:
+        log.info(f"  [{pair}] Nothing to fetch")
+        status_update(symbol_status="up_to_date")
+        if repair:
+            save_ledger(ledger_file, ledger)
+        return existing_df, []
 
-    log.info(f"  [{pair}] Downloading {len(days)} trading days ({days[0]} -> {days[-1]})...")
-    status_update(
-        current_symbol=pair,
-        symbol_progress=f"{symbol_idx}/{total_symbols}",
-        symbol_status="downloading",
-        days_total=len(days),
-        days_completed=0,
-        days_failed=0,
-        ticks_total=0,
-    )
+    n_hours = sum(len(hs) for _, hs in work)
+    log.info(f"  [{pair}] {mode}: {len(work)} days / {n_hours:,} hours "
+             f"({work[0][0]} -> {work[-1][0]})...")
+    status_update(symbol_status="downloading", days_total=len(work), days_completed=0,
+                  hours_failed=0, hours_empty=0, hours_lost=0, ticks_total=0)
 
-    # Reset perf counters so this symbol's totals are clean.
     PERF.reset()
     rss_at_start_mb = rss_peak_mb()
     rss_at_last_log_mb = rss_at_start_mb
     log.info(f"    [{pair}] RSS at start: {rss_at_start_mb:.0f} MB (peak)")
 
-    m5_frames: list[pd.DataFrame] = []
+    m5_frames: list = []
+    run_status: dict = {}          # Timestamp -> fetch status for this run
     completed = 0
-    failed_days = 0
     ticks_total = 0
     sym_t0 = time.time()
 
+    def _progress(force: bool = False):
+        nonlocal rss_at_last_log_mb
+        if not (force or completed % 20 == 0):
+            return
+        elapsed = time.time() - sym_t0
+        rate = completed / elapsed if elapsed > 0 else 0
+        eta_m = ((len(work) - completed) / rate / 60) if rate > 0 else 0
+        snap = PERF.snapshot()
+        rss_mb = rss_peak_mb()
+        rss_delta = rss_mb - rss_at_last_log_mb
+        rss_at_last_log_mb = rss_mb
+        mb_dl = snap.get("bytes_downloaded", 0) / (1024 ** 2)
+        n_failed = sum(1 for s in run_status.values() if s == "failed")
+        n_empty = sum(1 for s in run_status.values() if s == "empty")
+        log.info(
+            f"    [{pair}] {completed}/{len(work)} days  {ticks_total:,} ticks  "
+            f"{rate:.1f} days/s  ETA {eta_m:.0f}m  RSS {rss_mb:.0f}MB (+{rss_delta:.0f})  "
+            f"DL {mb_dl:.0f}MB  net/dec/res {snap.get('net_seconds', 0):.0f}/"
+            f"{snap.get('decode_seconds', 0):.0f}/{snap.get('resample_seconds', 0):.0f}s  "
+            f"retries={int(snap.get('http_retries', 0))} failed_hours={n_failed} "
+            f"empty_hours={n_empty}  "
+            f"day p95/max {snap.get('day_p95_s', 0):.1f}/{snap.get('day_max_s', 0):.1f}s"
+        )
+        status_update(
+            days_completed=completed, ticks_total=ticks_total,
+            rate_days_per_sec=round(rate, 2), eta_minutes=round(eta_m, 1),
+            rss_peak_mb=round(rss_mb, 1), bytes_downloaded_mb=round(mb_dl, 1),
+            net_seconds=round(snap.get("net_seconds", 0), 1),
+            decode_seconds=round(snap.get("decode_seconds", 0), 1),
+            resample_seconds=round(snap.get("resample_seconds", 0), 1),
+            http_retries=int(snap.get("http_retries", 0)),
+            http_failures=int(snap.get("http_failures", 0)),
+            hours_failed=n_failed, hours_empty=n_empty,
+            day_p95_seconds=round(snap.get("day_p95_s", 0), 2),
+            day_max_seconds=round(snap.get("day_max_s", 0), 2),
+        )
+
     with ThreadPoolExecutor(max_workers=DAY_WORKERS) as pool:
         futures = {
-            pool.submit(download_day_ticks, pair, day, point_divider): day
-            for day in days
+            pool.submit(download_day_ticks, pair, day, point_divider, hours): (day, hours)
+            for day, hours in work
         }
         for future in as_completed(futures):
-            day = futures[future]
+            day, hours = futures[future]
             try:
-                day_m5, day_tick_count = future.result()
-                if not day_m5.empty:
-                    m5_frames.append(day_m5)
-                ticks_total += day_tick_count
-                completed += 1
+                day_m5, day_ticks, day_status = future.result()
+            except Exception as e:                       # defensive: treat as all failed
+                log.warning(f"    [{pair}] Day {day} raised {e!r}; marking hours failed")
+                day_m5, day_ticks, day_status = _EMPTY_M5_DF.copy(), 0, {h: "failed" for h in hours}
+            if not day_m5.empty:
+                m5_frames.append(day_m5)
+            for h, st in day_status.items():
+                run_status[hour_ts(day, h)] = st
+            ticks_total += day_ticks
+            completed += 1
+            _progress(force=(completed == len(work)))
+            log.debug(f"    [{pair}] {day}: {day_ticks:,} ticks")
 
-                if completed % 20 == 0 or completed == len(days):
-                    elapsed = time.time() - sym_t0
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    eta_s = (len(days) - completed) / rate if rate > 0 else 0
-                    eta_m = eta_s / 60
-                    snap = PERF.snapshot()
-                    rss_mb = rss_peak_mb()
-                    rss_delta = rss_mb - rss_at_last_log_mb
-                    rss_at_last_log_mb = rss_mb
-                    mb_dl = snap.get("bytes_downloaded", 0) / (1024 ** 2)
-                    net_s = snap.get("net_seconds", 0)
-                    dec_s = snap.get("decode_seconds", 0)
-                    res_s = snap.get("resample_seconds", 0)
-                    retries = int(snap.get("http_retries", 0))
-                    failures = int(snap.get("http_failures", 0))
-                    day_p95 = snap.get("day_p95_s", 0)
-                    day_max = snap.get("day_max_s", 0)
+    # --- Sweep: one sequential retry pass over hours that failed in the main pass
+    failed_hours = sorted(ts for ts, st in run_status.items() if st == "failed")
+    hours_failed = len(failed_hours)
+    if failed_hours:
+        log.info(f"  [{pair}] Sweep: re-fetching {hours_failed} failed hours sequentially...")
+        status_update(symbol_status="sweeping", hours_failed=hours_failed)
+        sweep_ticks: list = []
+        for ts in failed_hours:
+            _, st, tdf = _download_and_decode_hour(pair, ts.date(), ts.hour, point_divider)
+            run_status[ts] = st
+            if not tdf.empty:
+                sweep_ticks.append(tdf)
+                ticks_total += len(tdf)
+        if sweep_ticks:
+            m5_frames.append(ticks_to_m5(pd.concat(sweep_ticks, ignore_index=True)))
 
-                    log.info(
-                        f"    [{pair}] {completed}/{len(days)} days  "
-                        f"{ticks_total:,} ticks  "
-                        f"{rate:.1f} days/s  "
-                        f"ETA {eta_m:.0f}m  "
-                        f"RSS {rss_mb:.0f}MB (+{rss_delta:.0f})  "
-                        f"DL {mb_dl:.0f}MB  "
-                        f"net/dec/res {net_s:.0f}/{dec_s:.0f}/{res_s:.0f}s  "
-                        f"retries={retries} fail={failures}  "
-                        f"day p95/max {day_p95:.1f}/{day_max:.1f}s"
-                    )
-                    status_update(
-                        days_completed=completed,
-                        days_failed=failed_days,
-                        ticks_total=ticks_total,
-                        rate_days_per_sec=round(rate, 2),
-                        eta_minutes=round(eta_m, 1),
-                        rss_peak_mb=round(rss_mb, 1),
-                        bytes_downloaded_mb=round(mb_dl, 1),
-                        net_seconds=round(net_s, 1),
-                        decode_seconds=round(dec_s, 1),
-                        resample_seconds=round(res_s, 1),
-                        http_retries=retries,
-                        http_failures=failures,
-                        day_p95_seconds=round(day_p95, 2),
-                        day_max_seconds=round(day_max, 2),
-                    )
+    lost = sorted(ts for ts, st in run_status.items() if st == "failed")
+    hours_empty = sum(1 for st in run_status.values() if st == "empty")
 
-                log.debug(f"    [{pair}] {day}: {day_tick_count:,} ticks")
-
-            except Exception as e:
-                failed_days += 1
-                log.warning(f"    [{pair}] Failed day {day}: {e}")
-
-    if failed_days:
-        log.warning(f"    [{pair}] {failed_days}/{len(days)} days failed")
-
-    log.info(f"  [{pair}] Combining {len(m5_frames)} days of M5 bars...")
+    # --- Merge with whatever is already on disk
+    log.info(f"  [{pair}] Combining {len(m5_frames)} chunks of M5 bars...")
     status_update(symbol_status="combining")
     concat_t0 = time.perf_counter()
-    if m5_frames:
-        m5_df = pd.concat(m5_frames, ignore_index=True).sort_values("time").reset_index(drop=True)
+    new_m5 = (pd.concat(m5_frames, ignore_index=True) if m5_frames else _EMPTY_M5_DF.copy())
+    if existing_df is not None and not new_m5.empty:
+        m5_df = pd.concat([existing_df, new_m5], ignore_index=True)
+    elif existing_df is not None:
+        m5_df = existing_df
     else:
-        m5_df = _EMPTY_M5_DF.copy()
+        m5_df = new_m5
+    if not m5_df.empty:
+        m5_df = (m5_df.drop_duplicates(subset=["time"], keep="last")
+                 .sort_values("time").reset_index(drop=True))
     del m5_frames
     concat_seconds = time.perf_counter() - concat_t0
-    log.info(f"    [{pair}] Concat+sort done in {concat_seconds:.1f}s, RSS {rss_peak_mb():.0f}MB peak")
 
-    # End-of-symbol perf summary
     snap = PERF.snapshot()
-    sym_elapsed = time.time() - sym_t0
     log.info(
-        f"    [{pair}] PERF summary: "
-        f"elapsed {sym_elapsed/60:.1f}m  "
+        f"    [{pair}] PERF summary: elapsed {(time.time() - sym_t0)/60:.1f}m  "
         f"DL {_fmt_bytes(snap.get('bytes_downloaded', 0))} "
         f"(decompressed {_fmt_bytes(snap.get('bytes_decompressed', 0))})  "
         f"ticks {int(snap.get('ticks_decoded', 0)):,}  "
-        f"net {snap.get('net_seconds', 0):.0f}s  "
-        f"decode {snap.get('decode_seconds', 0):.0f}s  "
-        f"resample {snap.get('resample_seconds', 0):.0f}s  "
-        f"concat {concat_seconds:.1f}s  "
-        f"http: {int(snap.get('http_requests', 0))} req / "
-        f"{int(snap.get('http_404', 0))} 404 / "
-        f"{int(snap.get('http_retries', 0))} retries / "
-        f"{int(snap.get('http_failures', 0))} fail  "
-        f"day p50/p95/max {snap.get('day_p50_s', 0):.1f}/{snap.get('day_p95_s', 0):.1f}/{snap.get('day_max_s', 0):.1f}s  "
+        f"net {snap.get('net_seconds', 0):.0f}s  decode {snap.get('decode_seconds', 0):.0f}s  "
+        f"resample {snap.get('resample_seconds', 0):.0f}s  concat {concat_seconds:.1f}s  "
+        f"http: {int(snap.get('http_requests', 0))} req / {int(snap.get('http_404', 0))} 404 / "
+        f"{int(snap.get('http_empty', 0))} empty / {int(snap.get('http_retries', 0))} retries / "
+        f"{int(snap.get('http_failures', 0))} give-ups  "
+        f"hours: {hours_failed} failed in main pass, {len(lost)} lost after sweep  "
         f"RSS peak {rss_peak_mb():.0f}MB (Δ +{rss_peak_mb() - rss_at_start_mb:.0f})"
     )
 
-    if m5_df.empty and existing_df is None:
+    # --- Persist ledger regardless of whether we got bars
+    for ts, st in run_status.items():
+        ledger[ts] = FETCH_TO_LEDGER[st]
+    save_ledger(ledger_file, ledger)
+
+    if m5_df.empty:
         log.warning(f"  [{pair}] No data retrieved")
-        return None
+        status_update(symbol_status="completed", hours_failed=hours_failed,
+                      hours_empty=hours_empty, hours_lost=len(lost))
+        return None, lost
 
-    # Merge with existing data if incremental
-    if existing_df is not None and not m5_df.empty:
-        m5_df = pd.concat([existing_df, m5_df], ignore_index=True)
-        m5_df = m5_df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
-    elif existing_df is not None:
-        m5_df = existing_df
-
-    # Save M5
     status_update(symbol_status="saving")
-    m5_path = COMPILED_DIR / f"{pair}_M5.csv"
     m5_df.to_csv(m5_path, index=False)
-
-    # Resample and save higher timeframes
     for tf_name, rule in [("H1", "1h"), ("H4", "4h"), ("D1", "1D")]:
         tf_df = resample_ohlc(m5_df, rule)
-        tf_path = COMPILED_DIR / f"{pair}_{tf_name}.csv"
-        tf_df.to_csv(tf_path, index=False)
-        log.debug(f"  [{pair}] {tf_name}: {len(tf_df):,} bars -> {tf_path}")
+        tf_df.to_csv(COMPILED_DIR / f"{pair}_{tf_name}.csv", index=False)
+        log.debug(f"  [{pair}] {tf_name}: {len(tf_df):,} bars")
 
-    # Update metadata
-    last_ts = m5_df["time"].max()
-    last_date_str = str(last_ts.date() if hasattr(last_ts, "date") else pd.Timestamp(last_ts).date())
-    meta[pair] = {
-        "last_date": last_date_str,
-        "bars_m5": len(m5_df),
-        "updated": str(datetime.date.today()),
-    }
+    last_ts = pd.Timestamp(m5_df["time"].max())
+    meta[pair] = {"last_date": str(last_ts.date()), "bars_m5": len(m5_df),
+                  "updated": str(datetime.date.today())}
     save_meta(meta)
 
-    date_range = f"{m5_df['time'].min()} -> {m5_df['time'].max()}"
     unique_days = m5_df["time"].dt.date.nunique()
-    log.info(f"  [{pair}] Done: {len(m5_df):,} M5 bars, {unique_days} days  ({date_range})")
-    status_update(
-        symbol_status="completed",
-        bars_m5=len(m5_df),
-        unique_days=unique_days,
-    )
-
-    return m5_df
+    log.info(f"  [{pair}] Done: {len(m5_df):,} M5 bars, {unique_days} days  "
+             f"({m5_df['time'].min()} -> {m5_df['time'].max()})")
+    if lost:
+        log.warning(f"  [{pair}] {len(lost)} hour(s) LOST after retries and sweep:")
+        for a, b, n in group_runs(lost)[:50]:
+            log.warning(f"      {a:%Y-%m-%d %H:%M} -> {b:%Y-%m-%d %H:%M}  ({n}h)")
+        log.warning(f"  [{pair}] run: python3 download.py --repair --symbols {pair}")
+    status_update(symbol_status="completed", bars_m5=len(m5_df), unique_days=unique_days,
+                  hours_failed=hours_failed, hours_empty=hours_empty, hours_lost=len(lost))
+    return m5_df, lost
 
 
 def run(
-    symbols: list[str],
+    symbols: list,
     years: int = DEFAULT_YEARS,
     incremental: bool = False,
-    start_override: datetime.date | None = None,
-    end_override: datetime.date | None = None,
-):
-    """Run the full download pipeline for all symbols."""
-    end = end_override or (datetime.date.today() - datetime.timedelta(days=1))
-    start = start_override or (end - datetime.timedelta(days=365 * years))
+    start_override: Optional[datetime.date] = None,
+    end_override: Optional[datetime.date] = None,
+    repair: bool = False,
+) -> int:
+    """Run the pipeline for all symbols. Returns the total number of lost hours."""
+    if repair:
+        start, end = start_override, end_override          # None = whole ledger range
+        range_txt = f"{start or 'ledger start'} -> {end or 'ledger end'} (repair)"
+    else:
+        end = end_override or (datetime.date.today() - datetime.timedelta(days=1))
+        start = start_override or (end - datetime.timedelta(days=365 * years))
+        range_txt = f"{start} -> {end}"
+    mode = "repair" if repair else ("incremental" if incremental else "download")
 
     COMPILED_DIR.mkdir(parents=True, exist_ok=True)
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
 
     header = (
         f"{'='*60}\n"
         f"Dukascopy Direct Tick Downloader\n"
         f"{'='*60}\n"
         f"  Symbols:     {', '.join(symbols)}\n"
-        f"  Range:       {start} -> {end}\n"
-        f"  Incremental: {incremental}\n"
+        f"  Range:       {range_txt}\n"
+        f"  Mode:        {mode}\n"
         f"  Day workers: {DAY_WORKERS}  |  Hour workers: {HOUR_WORKERS}\n"
         f"  Output:      {COMPILED_DIR}/\n"
+        f"  Ledger:      {LEDGER_DIR}/\n"
         f"  Log:         {LOG_DIR}/\n"
         f"  Status:      {STATUS_FILE}\n"
         f"{'='*60}"
     )
     log.info(header)
-
-    status_update(
-        state="running",
-        symbols=symbols,
-        date_range=f"{start} -> {end}",
-        incremental=incremental,
-        started=datetime.datetime.now().isoformat(timespec="seconds"),
-        symbols_completed=[],
-        symbols_remaining=list(symbols),
-    )
+    status_update(state="running", symbols=symbols, date_range=range_txt, mode=mode,
+                  incremental=incremental,
+                  started=datetime.datetime.now().isoformat(timespec="seconds"),
+                  symbols_completed=[], symbols_remaining=list(symbols),
+                  hours_lost=0, lost_hours=[])
 
     frames = []
     t0 = time.time()
     completed_symbols = []
+    all_lost: list = []
 
     for i, sym in enumerate(symbols, 1):
         sym_t0 = time.time()
         status_update(symbols_remaining=[s for s in symbols if s not in completed_symbols and s != sym])
-
-        df = download_symbol(sym, start, end, incremental=incremental,
-                             symbol_idx=i, total_symbols=len(symbols))
+        df, lost = download_symbol(sym, start, end, incremental=incremental, repair=repair,
+                                   symbol_idx=i, total_symbols=len(symbols))
+        all_lost.extend(lost)
         elapsed = time.time() - sym_t0
-
         if df is not None:
             frames.append((sym, df))
             completed_symbols.append(sym)
             log.info(f"  [{sym}] Finished in {elapsed/60:.1f}m\n")
         else:
             log.warning(f"  [{sym}] No data\n")
+        status_update(symbols_completed=completed_symbols, hours_lost=len(all_lost),
+                      lost_hours=[t.strftime("%Y-%m-%dT%H:00:00Z") for t in all_lost[:200]])
 
-        status_update(symbols_completed=completed_symbols)
-
-    # Combined M5 file
     if frames:
         log.info("Building combined all_pairs_M5.csv...")
-        combined = pd.concat(
-            [df.assign(symbol=sym) for sym, df in frames],
-            ignore_index=True,
-        ).sort_values(["symbol", "time"]).reset_index(drop=True)
-        combined_path = COMPILED_DIR / "all_pairs_M5.csv"
-        combined.to_csv(combined_path, index=False)
+        combined = pd.concat([df.assign(symbol=sym) for sym, df in frames], ignore_index=True
+                             ).sort_values(["symbol", "time"]).reset_index(drop=True)
+        combined.to_csv(COMPILED_DIR / "all_pairs_M5.csv", index=False)
 
-    total = time.time() - t0
-    total_m = total / 60
-
-    summary_lines = [
-        f"\n{'='*60}",
-        f"COMPLETE  ({total_m:.1f} minutes total)",
-        f"{'='*60}",
-    ]
+    total_m = (time.time() - t0) / 60
+    summary_lines = [f"\n{'='*60}", f"COMPLETE  ({total_m:.1f} minutes total)", f"{'='*60}"]
     for sym, df in frames:
-        date_min = df["time"].min()
-        date_max = df["time"].max()
-        unique_days = df["time"].dt.date.nunique()
         summary_lines.append(
-            f"  {sym:<10} {len(df):>9,} M5 bars  {unique_days:>5} days   {date_min} -> {date_max}"
-        )
+            f"  {sym:<10} {len(df):>9,} M5 bars  {df['time'].dt.date.nunique():>5} days   "
+            f"{df['time'].min()} -> {df['time'].max()}")
+    if all_lost:
+        summary_lines.append(f"\n  WARNING: {len(all_lost)} hour(s) lost after retries and sweep. "
+                             f"Run: python3 download.py --repair")
     summary_lines.append(f"\n  Timeframes: M5, H1, H4, D1")
     summary_lines.append(f"  Files in:   {COMPILED_DIR}/")
+    log.info("\n".join(summary_lines))
 
-    summary = "\n".join(summary_lines)
-    log.info(summary)
+    status_update(state="completed", total_minutes=round(total_m, 1),
+                  finished=datetime.datetime.now().isoformat(timespec="seconds"),
+                  hours_lost=len(all_lost),
+                  lost_hours=[t.strftime("%Y-%m-%dT%H:00:00Z") for t in all_lost[:200]])
+    return len(all_lost)
 
-    status_update(
-        state="completed",
-        total_minutes=round(total_m, 1),
-        finished=datetime.datetime.now().isoformat(timespec="seconds"),
-    )
+
+# ---------------------------------------------------------------------------
+# Destructive actions (--clear / --fresh)
+# ---------------------------------------------------------------------------
+
+def symbol_data_files(pair: str) -> list:
+    """Existing compiled CSVs and the ledger for one symbol."""
+    paths = [COMPILED_DIR / f"{pair}_{tf}.csv" for tf in ("M5", "H1", "H4", "D1")]
+    paths.append(ledger_path(LEDGER_DIR, pair))
+    return [p for p in paths if p.exists()]
+
+
+def confirm_delete(symbols: list, assume_yes: bool, stdin=None, out=print) -> bool:
+    """Print what will be deleted plus a backup reminder; require the literal
+    word DELETE unless assume_yes. Never deletes on a silent default."""
+    stdin = stdin if stdin is not None else sys.stdin
+    files = [p for s in symbols for p in symbol_data_files(s)]
+    out(f"About to DELETE compiled data and ledger for {', '.join(symbols)}:")
+    if not files:
+        out("  (no files found)")
+    for p in files:
+        try:
+            rel = p.relative_to(BASE_DIR)
+        except ValueError:
+            rel = p
+        out(f"  {str(rel):<40} {_fmt_bytes(p.stat().st_size):>10}")
+    out("This cannot be undone. Back up compiled/ and ledger/ first if you need them")
+    out(f"(e.g. cp -r compiled ledger ~/duka-backup-{datetime.date.today()}).")
+    if assume_yes:
+        out("--yes given: skipping confirmation.")
+        return True
+    if not getattr(stdin, "isatty", lambda: False)():
+        out("stdin is not a terminal; pass --yes to confirm non-interactively. Aborting.")
+        return False
+    out("Type DELETE to continue:")
+    answer = stdin.readline().strip()
+    if answer != "DELETE":
+        out("Aborted. Nothing was deleted.")
+        return False
+    return True
+
+
+def delete_symbol_data(symbols: list) -> list:
+    deleted = []
+    for s in symbols:
+        for p in symbol_data_files(s):
+            p.unlink()
+            deleted.append(p)
+    return deleted
+
+
+def clear_symbols(symbols: list, assume_yes: bool) -> int:
+    """--clear entry point. Returns an exit code."""
+    if not confirm_delete(symbols, assume_yes):
+        return 2
+    deleted = delete_symbol_data(symbols)
+    for p in deleted:
+        log.info(f"deleted {p}")
+    log.info(f"Cleared {len(deleted)} file(s) for {', '.join(symbols)}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download Dukascopy tick data and compile to OHLC bars",
+        epilog="Exit codes: 0 ok, 1 hours still lost after retries (run --repair), "
+               "2 destructive action aborted.",
     )
-    parser.add_argument(
-        "--symbols", nargs="+", default=SYMBOLS,
-        help=f"Pairs to download (default: {' '.join(SYMBOLS)})",
-    )
-    parser.add_argument(
-        "--years", type=int, default=DEFAULT_YEARS,
-        help=f"Years of history (default: {DEFAULT_YEARS})",
-    )
-    parser.add_argument(
-        "--start", type=str, default=None,
-        help="Start date override (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--end", type=str, default=None,
-        help="End date override (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--incremental", action="store_true",
-        help="Only download new data since last run",
-    )
-    args = parser.parse_args()
+    parser.add_argument("--symbols", nargs="+", default=SYMBOLS,
+                        help=f"Pairs to download (default: {' '.join(SYMBOLS)})")
+    parser.add_argument("--years", type=int, default=DEFAULT_YEARS,
+                        help=f"Years of history (default: {DEFAULT_YEARS})")
+    parser.add_argument("--start", type=str, default=None, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, default=None, help="End date, exclusive (YYYY-MM-DD)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--incremental", action="store_true",
+                      help="Only download days after the last attempted day in the ledger")
+    mode.add_argument("--repair", action="store_true",
+                      help="Re-fetch hours that failed or were never attempted (ledger-driven); "
+                           "--start/--end narrow the range")
+    mode.add_argument("--fresh", action="store_true",
+                      help="Delete the symbols' compiled files and ledger first, then download")
+    mode.add_argument("--clear", action="store_true",
+                      help="Delete the symbols' compiled files and ledger, then exit")
+    parser.add_argument("--yes", action="store_true",
+                        help="Skip the DELETE confirmation for --fresh/--clear")
+    return parser
 
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    symbols = [s.upper() for s in args.symbols]
     start = datetime.date.fromisoformat(args.start) if args.start else None
     end = datetime.date.fromisoformat(args.end) if args.end else None
 
-    run(
-        symbols=[s.upper() for s in args.symbols],
-        years=args.years,
-        incremental=args.incremental,
-        start_override=start,
-        end_override=end,
-    )
+    if args.clear:
+        return clear_symbols(symbols, args.yes)
+    if args.fresh:
+        if not confirm_delete(symbols, args.yes):
+            return 2
+        for p in delete_symbol_data(symbols):
+            log.info(f"deleted {p}")
+
+    lost = run(symbols=symbols, years=args.years, incremental=args.incremental,
+               start_override=start, end_override=end, repair=args.repair)
+    return 1 if lost else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
