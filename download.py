@@ -36,7 +36,6 @@ import datetime
 import json
 import logging
 import lzma
-import resource
 import struct
 import sys
 import threading
@@ -149,11 +148,79 @@ def status_update(**kwargs):
 # macOS, kilobytes on Linux. We track peak (not current) because the stdlib has
 # no portable way to read current RSS; peak deltas between samples still tell
 # us when memory grew.
-_RU_MAXRSS_TO_BYTES = 1 if sys.platform == "darwin" else 1024
+# On Windows the `resource` module is unavailable; we fall back to
+# `GetProcessMemoryInfo` (PeakWorkingSetSize) via ctypes — still stdlib-only.
+try:
+    import resource as _resource_mod                      # noqa: F401  (POSIX only)
+    _HAS_RESOURCE = True
+except ImportError:
+    _resource_mod = None
+    _HAS_RESOURCE = False
+
+if _HAS_RESOURCE:
+    _RU_MAXRSS_TO_BYTES = 1 if sys.platform == "darwin" else 1024
+
+
+def _rss_peak_mb_resource() -> float:
+    return (_resource_mod.getrusage(_resource_mod.RUSAGE_SELF).ru_maxrss
+            * _RU_MAXRSS_TO_BYTES / (1024 * 1024))
+
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    _GetCurrentProcess = ctypes.windll.kernel32.GetCurrentProcess
+    _GetCurrentProcess.argtypes = []
+    _GetCurrentProcess.restype = wintypes.HANDLE
+
+    # GetProcessMemoryInfo lives in psapi.dll (also re-exported by kernel32 on
+    # recent Windows 10+, but psapi is the canonical home).
+    _Psapi = ctypes.WinDLL("psapi.dll")
+    _GetProcessMemoryInfo = _Psapi.GetProcessMemoryInfo
+    _GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_PROCESS_MEMORY_COUNTERS),
+        ctypes.c_size_t,
+    ]
+    _GetProcessMemoryInfo.restype = wintypes.BOOL
+
+    _PROCESS_MEMORY_COUNTERS_SIZE = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS)
+    _COUNTERS = _PROCESS_MEMORY_COUNTERS()
+    _COUNTERS.cb = _PROCESS_MEMORY_COUNTERS_SIZE
+    _CURRENT_PROC_HANDLE = _GetCurrentProcess()
+
+
+    def _rss_peak_mb_windows() -> float:
+        if not _GetProcessMemoryInfo(
+            _CURRENT_PROC_HANDLE,
+            ctypes.byref(_COUNTERS),
+            _PROCESS_MEMORY_COUNTERS_SIZE,
+        ):
+            return 0.0
+        return _COUNTERS.PeakWorkingSetSize / (1024 * 1024)
 
 
 def rss_peak_mb() -> float:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _RU_MAXRSS_TO_BYTES / (1024 * 1024)
+    if _HAS_RESOURCE:
+        return _rss_peak_mb_resource()
+    if sys.platform == "win32":
+        return _rss_peak_mb_windows()
+    return 0.0
 
 
 class Perf:
