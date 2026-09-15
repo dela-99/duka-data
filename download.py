@@ -36,7 +36,7 @@ import datetime
 import json
 import logging
 import lzma
-#import resource
+import resource
 import struct
 import sys
 import threading
@@ -153,7 +153,7 @@ _RU_MAXRSS_TO_BYTES = 1 if sys.platform == "darwin" else 1024
 
 
 def rss_peak_mb() -> float:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _RU_MAXRSS_TO_BYTES / (1024 * 1024) # pyright: ignore[reportUndefinedVariable]
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _RU_MAXRSS_TO_BYTES / (1024 * 1024)
 
 
 class Perf:
