@@ -36,7 +36,7 @@ import datetime
 import json
 import logging
 import lzma
-import resource
+#import resource
 import struct
 import sys
 import threading
